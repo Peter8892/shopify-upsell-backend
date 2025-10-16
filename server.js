@@ -7,111 +7,122 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ENV variables from Render
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // e.g. royalwholesalecandy.myshopify.com
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN; // your private access token
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN; // Private Admin API token
 
-// 🩺 Health check endpoint
-app.get("/healthz", (req, res) => {
-  res.json({ status: "ok" });
-});
+if (!SHOPIFY_STORE || !ADMIN_TOKEN) {
+  console.error("❌ Missing SHOPIFY_STORE or ADMIN_TOKEN environment variable.");
+  process.exit(1);
+}
 
-// 🛍 Fetch products from Shopify (optional endpoint)
-app.get("/api/products", async (req, res) => {
-  try {
-    const response = await fetch(
-      `https://${SHOPIFY_STORE}/admin/api/2025-10/products.json?limit=10`,
-      {
-        headers: {
-          "X-Shopify-Access-Token": ADMIN_TOKEN,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-    const data = await response.json();
-    res.json(data.products || []);
-  } catch (err) {
-    console.error("Error fetching products:", err);
-    res.status(500).json({ error: "Failed to fetch products" });
-  }
-});
+// --- Helper: fetch from Shopify API
+async function fetchShopify(endpoint) {
+  const url = `https://${SHOPIFY_STORE}/admin/api/2025-10/${endpoint}`;
+  const res = await fetch(url, {
+    headers: {
+      "X-Shopify-Access-Token": ADMIN_TOKEN,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!res.ok) throw new Error(`Shopify API error ${res.status}: ${url}`);
+  return res.json();
+}
 
-// 💡 Upsell endpoint using past orders
+// --- Health check
+app.get("/healthz", (_, res) => res.json({ status: "ok" }));
+
+// --- Upsell route
 app.get("/api/upsell", async (req, res) => {
   const { customer_id } = req.query;
-
   if (!customer_id) {
     return res.status(400).json({ error: "Missing customer_id" });
   }
 
   try {
-    // Fetch last year of orders
+    // 1️⃣ Fetch customer orders (past year)
     const oneYearAgo = new Date();
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-    const dateQuery = oneYearAgo.toISOString();
 
-    const ordersResponse = await fetch(
-      `https://${SHOPIFY_STORE}/admin/api/2025-10/customers/${customer_id}/orders.json?status=any&created_at_min=${dateQuery}&limit=250`,
-      {
-        headers: {
-          "X-Shopify-Access-Token": ADMIN_TOKEN,
-          "Content-Type": "application/json",
-        },
-      }
+    const orderData = await fetchShopify(
+      `customers/${customer_id}/orders.json?status=any&created_at_min=${oneYearAgo.toISOString()}&limit=250`
     );
 
-    const ordersData = await ordersResponse.json();
-    const pastOrders = ordersData.orders || [];
-
-    // Weighted scoring based on recency
-    const productScores = {};
+    const orders = orderData.orders || [];
     const today = new Date();
+    const productScores = {};
 
-    pastOrders.forEach(order => {
-      const orderDate = new Date(order.created_at);
-      const daysAgo = (today - orderDate) / (1000 * 60 * 60 * 24); // days since order
+    orders.forEach(order => {
+      const daysAgo = (today - new Date(order.created_at)) / (1000 * 60 * 60 * 24);
       order.line_items.forEach(item => {
-        productScores[item.title] = (productScores[item.title] || 0) + 1 / (1 + daysAgo / 30);
+        const score = 1 / (1 + daysAgo / 30);
+        productScores[item.product_id] = (productScores[item.product_id] || 0) + score;
       });
     });
 
-    // Sort top 5 products
-    const topProducts = Object.entries(productScores)
+    // 2️⃣ Top previously purchased products
+    const topProductIds = Object.entries(productScores)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
-      .map(([title]) => title);
+      .map(([id]) => id);
 
-    // Seasonal suggestions (optional)
+    let topProducts = [];
+    if (topProductIds.length > 0) {
+      const prodData = await fetchShopify(`products.json?ids=${topProductIds.join(",")}`);
+      topProducts = prodData.products.map(p => ({
+        id: p.id,
+        title: p.title,
+        image: p.image?.src,
+        variant_id: p.variants?.[0]?.id,
+      }));
+    }
+
+    // 3️⃣ Seasonal logic using TAGS
     const month = new Date().getMonth();
-    const seasonalSuggestions = [
-      ["Candy Corn", "Pumpkin Spice Chocolate"], // Oct
-      ["Gingerbread Fudge", "Peppermint Bark"], // Dec
-      ["Valentine Hearts", "Strawberry Truffles"], // Feb
-      ["Easter Eggs", "Jelly Beans"], // Apr
-    ];
-    const season = seasonalSuggestions[Math.floor((month % 12) / 3)] || [];
+    let seasonalTag = null;
+    if (month === 9) seasonalTag = "halloween";
+    else if (month === 11) seasonalTag = "christmas";
+    else if (month === 1) seasonalTag = "valentine";
+    else if (month === 3) seasonalTag = "easter";
 
-    const randomMsg = [
+    let seasonalProducts = [];
+    if (seasonalTag) {
+      try {
+        const seasonData = await fetchShopify(
+          `products.json?limit=5&tag=${encodeURIComponent(seasonalTag)}`
+        );
+        seasonalProducts = seasonData.products.map(p => ({
+          id: p.id,
+          title: p.title,
+          image: p.image?.src,
+          variant_id: p.variants?.[0]?.id,
+        }));
+      } catch (err) {
+        console.warn(`⚠️ No seasonal products found for tag: ${seasonalTag}`);
+      }
+    }
+
+    // 4️⃣ Message
+    const messages = [
       "Looks like it’s that time again! Would you like to restock?",
       "We noticed you love these — perfect timing for this season!",
       "Back by popular demand! These pair perfectly with your usual picks.",
       "Special treat alert 🍫 — your favorites are trending again!",
     ];
-
     const message =
-      randomMsg[Math.floor(Math.random() * randomMsg.length)] +
-      (season.length ? ` Try our seasonal picks: ${season.join(", ")}.` : "");
+      messages[Math.floor(Math.random() * messages.length)] +
+      (seasonalProducts.length ? ` Check out our ${seasonalTag} picks!` : "");
 
+    // ✅ Response
     res.json({
       message,
-      recommended: [...season, ...topProducts],
+      recommended: [...seasonalProducts, ...topProducts],
     });
   } catch (err) {
-    console.error("Upsell error:", err);
+    console.error("Upsell error:", err.message);
     res.status(500).json({ error: "Failed to generate upsell" });
   }
 });
 
-// Start the server
+// --- Start server
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Upsell backend running on port ${PORT}`));
