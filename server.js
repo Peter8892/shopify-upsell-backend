@@ -7,17 +7,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ====== Environment Variables ======
-// Set these in Render → Settings → Environment Variables
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // e.g., royalwholesalecandy.myshopify.com
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN;     // Shopify Admin API private token
+// ENV variables from Render
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // e.g. royalwholesalecandy.myshopify.com
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN; // your private access token
 
-// ====== Health Check ======
+// 🩺 Health check endpoint
 app.get("/healthz", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// ====== Fetch Products (optional) ======
+// 🛍 Fetch products from Shopify (optional endpoint)
 app.get("/api/products", async (req, res) => {
   try {
     const response = await fetch(
@@ -29,7 +28,6 @@ app.get("/api/products", async (req, res) => {
         },
       }
     );
-
     const data = await response.json();
     res.json(data.products || []);
   } catch (err) {
@@ -38,7 +36,7 @@ app.get("/api/products", async (req, res) => {
   }
 });
 
-// ====== Dynamic Upsell Endpoint ======
+// 💡 Upsell endpoint using past orders
 app.get("/api/upsell", async (req, res) => {
   const { customer_id } = req.query;
 
@@ -47,9 +45,13 @@ app.get("/api/upsell", async (req, res) => {
   }
 
   try {
-    // 1️⃣ Fetch last 3 orders from Shopify
-    const orderResponse = await fetch(
-      `https://${SHOPIFY_STORE}/admin/api/2025-10/customers/${customer_id}/orders.json?status=any&limit=3`,
+    // Fetch last year of orders
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+    const dateQuery = oneYearAgo.toISOString();
+
+    const ordersResponse = await fetch(
+      `https://${SHOPIFY_STORE}/admin/api/2025-10/customers/${customer_id}/orders.json?status=any&created_at_min=${dateQuery}&limit=250`,
       {
         headers: {
           "X-Shopify-Access-Token": ADMIN_TOKEN,
@@ -58,56 +60,58 @@ app.get("/api/upsell", async (req, res) => {
       }
     );
 
-    const ordersData = await orderResponse.json();
+    const ordersData = await ordersResponse.json();
     const pastOrders = ordersData.orders || [];
 
-    // 2️⃣ Extract product names from last orders
-    const purchasedProducts = pastOrders.flatMap(order =>
-      order.line_items.map(item => item.title)
-    );
+    // Weighted scoring based on recency
+    const productScores = {};
+    const today = new Date();
 
-    // 3️⃣ Seasonal suggestions based on month
-    const month = new Date().getMonth(); // 0 = Jan, 11 = Dec
-    const seasonalRecommendations = {
-      0: ["Winter Chocolate Mix", "Hot Cocoa Bombs"],         // Jan
-      1: ["Valentine Hearts", "Strawberry Truffles"],         // Feb
-      2: ["Spring Gummies", "Chocolate Carrots"],            // Mar
-      3: ["Easter Eggs", "Jelly Beans"],                     // Apr
-      4: ["Mother's Day Chocolate Box", "Fruit Chews"],      // May
-      5: ["Summer Gummies", "Ice Cream Candy"],              // Jun
-      6: ["Patriotic Candies", "Berry Gummies"],             // Jul
-      7: ["Back to School Snacks", "Fun Size Chocolates"],   // Aug
-      8: ["Autumn Fudge", "Pumpkin Spice Treats"],           // Sep
-      9: ["Candy Corn", "Pumpkin Spice Chocolate"],          // Oct
-      10: ["Halloween Treats", "Chocolate Skeletons"],       // Nov
-      11: ["Gingerbread Fudge", "Peppermint Bark"],          // Dec
-    };
+    pastOrders.forEach(order => {
+      const orderDate = new Date(order.created_at);
+      const daysAgo = (today - orderDate) / (1000 * 60 * 60 * 24); // days since order
+      order.line_items.forEach(item => {
+        productScores[item.title] = (productScores[item.title] || 0) + 1 / (1 + daysAgo / 30);
+      });
+    });
 
-    const seasonal = seasonalRecommendations[month] || [];
+    // Sort top 5 products
+    const topProducts = Object.entries(productScores)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([title]) => title);
 
-    // 4️⃣ Random upsell message templates
-    const messages = [
+    // Seasonal suggestions (optional)
+    const month = new Date().getMonth();
+    const seasonalSuggestions = [
+      ["Candy Corn", "Pumpkin Spice Chocolate"], // Oct
+      ["Gingerbread Fudge", "Peppermint Bark"], // Dec
+      ["Valentine Hearts", "Strawberry Truffles"], // Feb
+      ["Easter Eggs", "Jelly Beans"], // Apr
+    ];
+    const season = seasonalSuggestions[Math.floor((month % 12) / 3)] || [];
+
+    const randomMsg = [
       "Looks like it’s that time again! Would you like to restock?",
       "We noticed you love these — perfect timing for this season!",
       "Back by popular demand! These pair perfectly with your usual picks.",
       "Special treat alert 🍫 — your favorites are trending again!",
-      "Seasonal specials you might enjoy!",
-      "Your favorites + our seasonal picks = perfect combo!",
     ];
 
-    const message = messages[Math.floor(Math.random() * messages.length)] +
-      (seasonal.length ? ` Try our seasonal picks: ${seasonal.join(", ")}.` : "");
+    const message =
+      randomMsg[Math.floor(Math.random() * randomMsg.length)] +
+      (season.length ? ` Try our seasonal picks: ${season.join(", ")}.` : "");
 
-    // 5️⃣ Combine purchased products + seasonal for recommendation
-    const recommended = [...new Set([...seasonal, ...purchasedProducts.slice(0, 3)])];
-
-    res.json({ message, recommended });
+    res.json({
+      message,
+      recommended: [...season, ...topProducts],
+    });
   } catch (err) {
     console.error("Upsell error:", err);
     res.status(500).json({ error: "Failed to generate upsell" });
   }
 });
 
-// ====== Start Server ======
+// Start the server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
